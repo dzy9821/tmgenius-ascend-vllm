@@ -67,6 +67,7 @@ class CWItem(BaseModel):
     wp: str = Field("n", description="词性标记")
     wb: int = Field(0, description="词汇起始时间（厘秒 cs）")
     we: int = Field(0, description="词汇结束时间（厘秒 cs）")
+    rl: int = Field(0, description="角色识别标记（当前不支持，默认 0）")
     sc: str = Field("0.00", description="分数")
     sf: int = Field(0, description="标志位")
     wc: str = Field("0.00", description="词置信度")
