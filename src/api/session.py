@@ -70,7 +70,10 @@ class ASRSession:
         # ---- 结果顺序保证 ----
         self._next_send_seg_id: int = 0
         self._result_buffer: dict[int, str] = {}
-        self._final_result_json: str | None = None  # flush 段暂存，与 status=2 捆绑发送
+        self._final_result_json: str | None = None  # flush 段完整 JSON 暂存
+        self._last_sent_result_json: str | None = None  # 上一句完整 JSON 快照
+        self._last_sent_seg_id: int = -1  # 上一句 segId（用于并发比较）
+        self._mid_stream_segment_sent: bool = False  # 是否已推送过 status=1
 
         # ---- 握手帧携带的首帧音频 ----
         self._first_audio_payload = None  # type: ignore

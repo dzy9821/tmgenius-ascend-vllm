@@ -281,7 +281,7 @@ async def _handle_audio_frame(
 
 
 async def _handle_end_frame(websocket: WebSocket, session: ASRSession) -> None:
-    """处理结束帧：刷空 VAD 缓冲区，等待所有 ASR 任务完成，推送终态。"""
+    """处理结束帧：刷空 VAD 缓冲区，等待所有 ASR 任务完成，合并 flush 文本后推送终态。"""
     session.set_closing()
 
     # 强制刷出残余音频（如有，标记为 final，与 status=2 捆绑发送）
@@ -295,15 +295,42 @@ async def _handle_end_frame(websocket: WebSocket, session: ASRSession) -> None:
     # 等待所有后台 ASR 任务完成，确保结果全部推送后再发终态
     await session.wait_pending_asr()
 
-    # 发送终态 (status=2)，flush 段文本一并携带
-    last_seg_id = max(0, session.seg_id - 1)
+    # 按终态合并规则组装 status=2 响应
     async with session.send_lock:
-        if session._final_result_json is not None:
+        if session._mid_stream_segment_sent:
+            # 有中间结果：以上一句 JSON 为基础合并 flush 文本
+            data = json.loads(session._last_sent_result_json)
+            data["header"]["status"] = 2
+            if session._final_result_json is not None:
+                flush_data = json.loads(session._final_result_json)
+                # 拼接文本
+                data["payload"]["result"]["ws"][0]["cw"][0]["w"] += (
+                    flush_data["payload"]["result"]["ws"][0]["cw"][0]["w"]
+                )
+                # 延伸结束时间
+                data["payload"]["result"]["ed"] = flush_data["payload"]["result"]["ed"]
+                data["payload"]["result"]["ws"][0]["cw"][0]["we"] = (
+                    flush_data["payload"]["result"]["ws"][0]["cw"][0]["we"]
+                )
+            logger.info(
+                "End frame merge: seg_id=%s, text=%s",
+                data["payload"]["result"]["segId"],
+                data["payload"]["result"]["ws"][0]["cw"][0]["w"],
+            )
+            await websocket.send_text(json.dumps(data, ensure_ascii=False))
+        elif session._final_result_json is not None:
+            # 全程一段（R3）：flush 结果直接作为 status=2 发送
             data = json.loads(session._final_result_json)
             data["header"]["status"] = 2
+            logger.info(
+                "End frame R3: text=%s",
+                data["payload"]["result"]["ws"][0]["cw"][0]["w"],
+            )
             await websocket.send_text(json.dumps(data, ensure_ascii=False))
         else:
-            await _send_response(websocket, session, status=2, seg_id=last_seg_id)
+            # 无任何识别结果
+            logger.info("End frame: no text to send")
+            await _send_response(websocket, session, status=2, seg_id=0)
 
 
 async def _close_connection(
@@ -327,8 +354,8 @@ async def _process_segment(
 
     此函数作为 asyncio.Task 在后台运行，不阻塞主循环的音频接收。
     通过 session.send_lock 保证多个并发任务的 WebSocket 写入互斥。
-    常规段以 status=1 发送；is_final=True 的 flush 段暂存至 session，
-    由 _handle_end_frame 改写为 status=2 后与终态一起发送。
+    常规段以 status=1 发送并记录快照；is_final=True 的 flush 段仅保存
+    识别结果到 session，由 _handle_end_frame 合并进上一句后以 status=2 发送。
     """
     t0 = time.monotonic()
     seg_id = session.next_seg_id()
@@ -396,12 +423,19 @@ async def _process_segment(
             payload=ResponsePayloadWrapper(result=result),
         )
 
+        result_json = response.model_dump_json()
+
         if is_final:
-            # 暂存完整 JSON，推进序号但不发送，后续由 _handle_end_frame 以 status=2 发送
-            session._final_result_json = response.model_dump_json()
+            # 暂存 flush 段完整 JSON，推进序号但不发送
+            session._final_result_json = result_json
             await session.push_result_in_order(websocket, seg_id, "")
         else:
-            await session.push_result_in_order(websocket, seg_id, response.model_dump_json())
+            await session.push_result_in_order(websocket, seg_id, result_json)
+            # 记录上一句快照，供终态合并使用（多任务并发时只保留最大 segId）
+            if seg_id >= session._last_sent_seg_id:
+                session._last_sent_seg_id = seg_id
+                session._last_sent_result_json = result_json
+                session._mid_stream_segment_sent = True
 
         asr_processing_latency_ms.observe(total_ms)
         asr_segments_total.inc()
