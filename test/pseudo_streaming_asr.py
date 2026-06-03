@@ -275,15 +275,13 @@ def run_pseudo_streaming(
         }
         results.append(result)
 
-        # 实时打印
-        new_indicator = f" (+{new_part})" if new_part else ""
+        # 实时打印：展示已累积的拼接文本
         print(
             f"  [{i + 1:3d}/{total_steps}]  "
             f"窗口={time_label:>20s}  "
-            f"({window_dur:.1f}s)  "
-            f"耗时={t_elapsed:7.1f}ms  "
-            f"原文: {text}{new_indicator}"
+            f"耗时={t_elapsed:7.1f}ms"
         )
+        print(f"             累积文本: {merged_text}")
 
     t_total_elapsed = (time.monotonic() - t_total_start) * 1000
 
