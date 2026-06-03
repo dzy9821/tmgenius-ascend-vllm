@@ -150,16 +150,34 @@ class ASRSession:
         self._progressive_audio_frames.append(frame)
         self._progressive_total_samples += len(frame)
 
-    def pop_progressive_audio(self) -> tuple[np.ndarray, int, int]:
-        """取出当前累积的片段音频，返回 (audio_int16, start_sample, end_sample)，并重置缓冲区。"""
+    def pop_progressive_audio(self, max_samples: int) -> tuple[np.ndarray, int, int]:
+        """取出最多 max_samples 的片段音频，余量留在缓冲区内。
+
+        返回 (audio_int16, start_sample, end_sample)。
+        缓冲区非空但不足 max_samples 时返回空（等待更多帧）。
+        """
         if not self._progressive_audio_frames:
             return np.array([], dtype=np.int16), 0, 0
-        audio = np.concatenate(self._progressive_audio_frames)
+
+        if self._progressive_total_samples < max_samples:
+            return np.array([], dtype=np.int16), 0, 0
+
+        taken: list[np.ndarray] = []
+        taken_samples = 0
+        while self._progressive_audio_frames and taken_samples < max_samples:
+            frame = self._progressive_audio_frames.pop(0)
+            taken.append(frame)
+            taken_samples += len(frame)
+
+        audio = np.concatenate(taken)
         start_sample = self._progressive_start_sample
-        end_sample = start_sample + self._progressive_total_samples
-        self._progressive_audio_frames = []
-        self._progressive_total_samples = 0
-        self._progressive_start_sample = 0
+        end_sample = start_sample + taken_samples
+
+        self._progressive_total_samples -= taken_samples
+        if self._progressive_audio_frames:
+            self._progressive_start_sample = end_sample
+        else:
+            self._progressive_start_sample = 0
         self._progressive_last_send_time = time.monotonic()
         return audio, start_sample, end_sample
 

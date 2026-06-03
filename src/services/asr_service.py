@@ -157,6 +157,15 @@ def _clean_asr_output(text: str) -> str:
     return "".join(part.strip() for part in parts if part.strip()).strip()
 
 
+# 匹配非中文字符（含标点、空格、英文字母、数字等）
+_NON_CHINESE_RE = re.compile(r"[^一-鿿]+")
+
+
+def _strip_non_chinese(text: str) -> str:
+    """移除所有非中文字符，仅保留汉字。"""
+    return _NON_CHINESE_RE.sub("", text)
+
+
 def build_hotword_context(hotwords: Optional[str]) -> str:
     """将客户端传入的热词构建为系统提示词。"""
     if not hotwords or not hotwords.strip():

@@ -44,7 +44,7 @@ from src.models.schemas import (
     ServerMessage,
     WSItem,
 )
-from src.services.asr_service import ASRError, ASRService, build_hotword_context
+from src.services.asr_service import ASRError, ASRService, _strip_non_chinese, build_hotword_context
 from src.services.itn_pool import ITNPool
 from src.utils.audio import decode_base64_opus, decode_base64_pcm, samples_to_cs, samples_to_ms
 
@@ -293,13 +293,12 @@ async def _handle_audio_frame(
         frame_start_sample = session._accumulated_audio_samples - len(pcm_int16)
         session.append_progressive_audio(pcm_int16, frame_start_sample)
 
-        now = time.monotonic()
-        elapsed = now - session._progressive_last_send_time
         task_idle = (session._progressive_task is None
                      or session._progressive_task.done())
 
-        if elapsed >= settings.PROGRESSIVE_STEP and task_idle:
-            audio, start_sample, end_sample = session.pop_progressive_audio()
+        step_samples = int(settings.PROGRESSIVE_STEP * 16000)
+        if session._progressive_total_samples >= step_samples and task_idle:
+            audio, start_sample, end_sample = session.pop_progressive_audio(step_samples)
             if len(audio) > 0:
                 session._progressive_task = asyncio.create_task(
                     _process_progressive(websocket, session, audio, start_sample, end_sample)
@@ -502,6 +501,8 @@ async def _process_progressive(
         raw_text = await progressive_asr_service.recognize(
             audio_int16, sr=16000, context=session.hotword_context
         )
+        # 仅保留中文，去除标点符号和非中文字符
+        raw_text = _strip_non_chinese(raw_text)
 
         # 累加本段文本到当前语音段的累积结果
         session._progressive_accumulated_text += raw_text
