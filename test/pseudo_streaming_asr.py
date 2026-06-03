@@ -134,55 +134,6 @@ def asr_recognize(
 
 
 # ============================================================
-# 滑动窗口去重拼接
-# ============================================================
-
-
-def merge_overlap_text(prev_text: str, new_text: str) -> str:
-    """对两段重叠窗口的识别结果去重拼接。
-
-    策略：找 prev_text 的最长后缀 == new_text 的前缀，
-    只追加 new_text 中不重叠的部分。
-    如果找不到重叠（可能模型输出不稳定），则直接拼接。
-    """
-    if not prev_text:
-        return new_text
-    if not new_text:
-        return prev_text
-
-    # 从最长可能的重叠开始，逐步缩短寻找匹配
-    max_overlap = min(len(prev_text), len(new_text))
-    for overlap_len in range(max_overlap, 0, -1):
-        if prev_text[-overlap_len:] == new_text[:overlap_len]:
-            return prev_text + new_text[overlap_len:]
-
-    # 没有精确匹配，尝试模糊匹配（去掉标点后比较）
-    _PUNCT_RE = re.compile(r"[，。！？、；：\u201c\u201d\u2018\u2019（）\s]")
-
-    prev_clean = _PUNCT_RE.sub("", prev_text)
-    new_clean = _PUNCT_RE.sub("", new_text)
-
-    max_overlap = min(len(prev_clean), len(new_clean))
-    for overlap_len in range(max_overlap, 0, -1):
-        if prev_clean[-overlap_len:] == new_clean[:overlap_len]:
-            # 找到模糊重叠，在原始 new_text 中定位对应位置
-            # 找到 new_clean[:overlap_len] 对应的原文结束位置
-            matched_clean_chars = 0
-            cut_pos = 0
-            for idx, ch in enumerate(new_text):
-                if _PUNCT_RE.match(ch):
-                    continue
-                matched_clean_chars += 1
-                if matched_clean_chars == overlap_len:
-                    cut_pos = idx + 1
-                    break
-            return prev_text + new_text[cut_pos:]
-
-    # 完全没有重叠，直接拼接
-    return prev_text + new_text
-
-
-# ============================================================
 # 伪流式测试主逻辑
 # ============================================================
 
@@ -199,8 +150,10 @@ def run_pseudo_streaming(
     """
     滑动窗口伪流式 ASR 测试。
 
-    每隔 step 秒取 window 秒的音频窗口送入 ASR 推理，
-    对重叠部分的识别结果去重后拼接为最终文本。
+    策略（比例提交法）：
+      - 每次窗口滑动时，前一个窗口"滑出"的音频比例对应的文本被提交（定稿）
+      - 当前窗口的完整识别结果作为"待定"文本，随时被下一个窗口替换
+      - 最后一个窗口的剩余文本全部提交
 
     Args:
         wav_path: WAV 文件路径
@@ -219,7 +172,7 @@ def run_pseudo_streaming(
     total_steps = (len(audio) + step_samples - 1) // step_samples
 
     print("=" * 74)
-    print(f"  伪流式 ASR 测试（滑动窗口）")
+    print("  伪流式 ASR 测试（滑动窗口 · 比例提交）")
     print("=" * 74)
     print(f"  音频文件  : {wav_path}")
     print(f"  音频时长  : {total_duration:.2f}s")
@@ -239,8 +192,13 @@ def run_pseudo_streaming(
     client = create_asr_client(base_url=base_url, api_key=api_key)
 
     results: list[dict] = []
-    merged_text = ""
     t_total_start = time.monotonic()
+
+    # ---- 比例提交状态 ----
+    committed_text = ""       # 已定稿的文本（不再变化）
+    prev_text = ""            # 上一个窗口的识别结果
+    prev_window_start = 0.0   # 上一个窗口的起始时间
+    prev_window_dur = 0.0     # 上一个窗口的实际时长
 
     for i in range(total_steps):
         # 窗口起止（向前取 window 秒，但不超过音频开头）
@@ -269,13 +227,23 @@ def run_pseudo_streaming(
             text = f"[ERROR: {exc}]"
         t_elapsed = (time.monotonic() - t_start) * 1000  # ms
 
-        # 去重拼接
+        # ---- 比例提交逻辑 ----
         if not text.startswith("[ERROR"):
-            prev_merged = merged_text
-            merged_text = merge_overlap_text(merged_text, text)
-            new_part = merged_text[len(prev_merged):]
-        else:
-            new_part = ""
+            # 计算前一个窗口"滑出"了多少音频
+            uncovered = window_time_start - prev_window_start
+
+            if uncovered > 0 and prev_text and prev_window_dur > 0:
+                # 按比例提交前一个窗口的文本
+                commit_ratio = min(1.0, uncovered / prev_window_dur)
+                commit_chars = max(1, round(len(prev_text) * commit_ratio))
+                committed_text += prev_text[:commit_chars]
+
+            prev_text = text
+            prev_window_start = window_time_start
+            prev_window_dur = window_dur
+
+        # 当前展示文本 = 已提交 + 当前窗口待定
+        display_text = committed_text + prev_text
 
         result = {
             "step_id": i + 1,
@@ -283,8 +251,8 @@ def run_pseudo_streaming(
             "window_duration_ms": int(window_dur * 1000),
             "asr_latency_ms": round(t_elapsed, 1),
             "raw_text": text,
-            "new_text": new_part,
-            "merged_so_far": merged_text,
+            "committed": committed_text,
+            "display": display_text,
         }
         results.append(result)
 
@@ -294,7 +262,11 @@ def run_pseudo_streaming(
             f"窗口={time_label:>20s}  "
             f"耗时={t_elapsed:7.1f}ms"
         )
-        print(f"             累积文本: {merged_text}")
+        print(f"             累积文本: {display_text}")
+
+    # 最后一个窗口的剩余文本全部提交
+    committed_text += prev_text
+    final_text = committed_text
 
     t_total_elapsed = (time.monotonic() - t_total_start) * 1000
 
@@ -317,23 +289,21 @@ def run_pseudo_streaming(
     print(f"  最大延迟    : {max(latencies):.1f}ms")
     print()
     print("  最终拼接结果:")
-    print(f"    {merged_text}")
+    print(f"    {final_text}")
     print()
     print("=" * 74)
 
     # ---- 逐步明细 ----
     print()
     print("  逐步明细:")
-    print(f"  {'步号':>4s}  {'窗口范围':>20s}  {'窗口ms':>6s}  {'延迟ms':>7s}  原文 → 新增部分")
+    print(f"  {'步号':>4s}  {'窗口范围':>20s}  {'延迟ms':>7s}  窗口原文")
     print("  " + "-" * 72)
     for r in results:
-        new_part = f" → +「{r['new_text']}」" if r["new_text"] else ""
         print(
             f"  {r['step_id']:4d}  "
             f"{r['window_range']:>20s}  "
-            f"{r['window_duration_ms']:6d}  "
             f"{r['asr_latency_ms']:7.1f}  "
-            f"{r['raw_text']}{new_part}"
+            f"{r['raw_text']}"
         )
     print()
 
