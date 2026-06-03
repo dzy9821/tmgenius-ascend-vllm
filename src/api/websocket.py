@@ -499,7 +499,7 @@ async def _process_progressive(
 
     try:
         raw_text = await progressive_asr_service.recognize(
-            audio_int16, sr=16000, context=session.hotword_context
+            audio_int16, sr=16000, context=""
         )
         # 仅保留中文，去除标点符号和非中文字符
         raw_text = _strip_non_chinese(raw_text)
