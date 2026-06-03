@@ -1,15 +1,15 @@
 """
-伪流式 ASR 测试 —— 滑动窗口模拟实时流式识别（异步版）。
+伪流式 ASR 测试 —— 按步进切片模拟实时流式识别（异步版）。
 
-按真实时间节奏每隔 step 秒发出一个窗口请求（不等前一个返回），
-结果按实际返回顺序展示。
+按真实时间节奏每隔 step 秒发出一个音频切片请求（不等前一个返回），
+结果按实际返回顺序展示，并实时显示累积拼接文本。
 
 用法：
     python test/pseudo_streaming_asr.py <wav_file> [options]
 
 示例：
     python test/pseudo_streaming_asr.py 120报警电话16k.wav
-    python test/pseudo_streaming_asr.py audio.wav --window 3.0 --step 0.5
+    python test/pseudo_streaming_asr.py audio.wav --step 0.5
     python test/pseudo_streaming_asr.py audio.wav --base-url http://10.0.0.1:28856/v1
 """
 
@@ -140,30 +140,26 @@ async def run_pseudo_streaming(
     api_key: str = "EMPTY",
     model: str = "Qwen3-ASR-0.6B",
     step: float = 0.4,
-    window: float = 2.0,
     context: str = "",
 ) -> None:
     """
-    滑动窗口伪流式 ASR 测试（异步版）。
+    伪流式 ASR 测试（异步版）。
 
-    按真实时间节奏每隔 step 秒发出请求，不等前一个返回。
-    结果按实际返回先后顺序展示。
+    将音频按 step 秒切片，按真实时间节奏每隔 step 秒发出请求，
+    不等前一个返回。结果按实际返回先后顺序展示，并实时拼接累积文本。
     """
     audio, sr = load_wav(wav_path, target_sr=16000)
     total_duration = len(audio) / sr
     step_samples = int(sr * step)
-    window_samples = int(sr * window)
     total_steps = (len(audio) + step_samples - 1) // step_samples
 
     print("=" * 74)
-    print("  伪流式 ASR 测试（滑动窗口 · 异步实时调度）")
+    print("  伪流式 ASR 测试（步进切片 · 异步实时调度）")
     print("=" * 74)
     print(f"  音频文件  : {wav_path}")
     print(f"  音频时长  : {total_duration:.2f}s")
     print(f"  采样率    : {sr} Hz")
-    print(f"  窗口大小  : {window}s")
     print(f"  步进间隔  : {step}s")
-    print(f"  重叠比例  : {(window - step) / window * 100:.0f}%")
     print(f"  总推理次数: {total_steps}")
     print(f"  模型      : {model}")
     print(f"  API 地址  : {base_url}")
@@ -175,25 +171,26 @@ async def run_pseudo_streaming(
     client = create_async_asr_client(base_url=base_url, api_key=api_key)
 
     results: list[dict] = []
+    step_texts: dict[int, str] = {}   # step_id -> 识别文本
     results_lock = asyncio.Lock()
     t_global_start = time.monotonic()
 
     async def _recognize_one(step_id: int):
-        """单个窗口的识别任务，完成后立即打印。"""
-        window_end_sample = min((step_id + 1) * step_samples, len(audio))
-        window_start_sample = max(0, window_end_sample - window_samples)
-        window_time_start = window_start_sample / sr
-        window_time_end = window_end_sample / sr
-        window_dur = window_time_end - window_time_start
-        time_label = f"{window_time_start:.2f}s → {window_time_end:.2f}s"
-        audio_window = audio[window_start_sample:window_end_sample]
+        """单个切片的识别任务，完成后立即打印并更新累积文本。"""
+        chunk_start_sample = step_id * step_samples
+        chunk_end_sample = min((step_id + 1) * step_samples, len(audio))
+        chunk_time_start = chunk_start_sample / sr
+        chunk_time_end = chunk_end_sample / sr
+        chunk_dur = chunk_time_end - chunk_time_start
+        time_label = f"{chunk_time_start:.2f}s → {chunk_time_end:.2f}s"
+        audio_chunk = audio[chunk_start_sample:chunk_end_sample]
 
         t_send = time.monotonic() - t_global_start
         t_start = time.monotonic()
         try:
             text = await asr_recognize(
                 client=client,
-                audio_f32=audio_window,
+                audio_f32=audio_chunk,
                 sr=sr,
                 model=model,
                 context=context,
@@ -205,8 +202,8 @@ async def run_pseudo_streaming(
 
         result = {
             "step_id": step_id + 1,
-            "window_range": time_label,
-            "window_duration_ms": int(window_dur * 1000),
+            "chunk_range": time_label,
+            "chunk_duration_ms": int(chunk_dur * 1000),
             "asr_latency_ms": round(t_elapsed, 1),
             "send_time": round(t_send, 3),
             "recv_time": round(t_recv, 3),
@@ -216,15 +213,21 @@ async def run_pseudo_streaming(
         async with results_lock:
             arrival_idx = len(results) + 1
             results.append(result)
+            # 记录该步的文本
+            if not text.startswith("[ERROR"):
+                step_texts[step_id] = text
+            # 按步号顺序拼接已有结果
+            concat = "".join(step_texts.get(s, "") for s in range(total_steps))
             print(
                 f"  [返回 {arrival_idx:3d}/{total_steps}]  "
                 f"步号={step_id + 1:3d}  "
-                f"窗口={time_label:>20s}  "
+                f"区间={time_label:>20s}  "
                 f"发送={t_send:6.2f}s  "
                 f"返回={t_recv:6.2f}s  "
                 f"耗时={t_elapsed:7.1f}ms"
             )
-            print(f"             识别文本: {text}")
+            print(f"             本段文本: {text}")
+            print(f"             累积拼接: {concat}")
 
     # 按真实时间调度：每隔 step 秒发射一个任务
     tasks: list[asyncio.Task] = []
@@ -309,15 +312,15 @@ async def run_pseudo_streaming(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="伪流式 ASR 测试：滑动窗口 + 异步实时调度，结果按返回顺序展示",
+        description="伪流式 ASR 测试：步进切片 + 异步实时调度，结果按返回顺序展示",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 默认：2s 窗口，0.4s 步进
+  # 默认：0.4s 步进
   python test/pseudo_streaming_asr.py 120报警电话16k.wav
 
-  # 自定义窗口和步进
-  python test/pseudo_streaming_asr.py audio.wav --window 3.0 --step 0.5
+  # 自定义步进
+  python test/pseudo_streaming_asr.py audio.wav --step 0.5
 
   # 自定义 API 地址
   python test/pseudo_streaming_asr.py audio.wav --base-url http://10.0.0.1:28856/v1
@@ -347,10 +350,6 @@ def main() -> None:
         help="步进间隔秒数 (默认: 0.4)",
     )
     parser.add_argument(
-        "--window", type=float, default=2.0,
-        help="窗口大小秒数 (默认: 2.0)",
-    )
-    parser.add_argument(
         "--context",
         default="",
         help="热词/系统提示词，如 '热词：张三丰、武当山'",
@@ -362,10 +361,6 @@ def main() -> None:
         print(f"ERROR: 文件不存在: {args.wav}")
         sys.exit(1)
 
-    if args.window < args.step:
-        print(f"ERROR: 窗口大小 ({args.window}s) 不能小于步进间隔 ({args.step}s)")
-        sys.exit(1)
-
     asyncio.run(
         run_pseudo_streaming(
             wav_path=args.wav,
@@ -373,7 +368,6 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             step=args.step,
-            window=args.window,
             context=args.context,
         )
     )
