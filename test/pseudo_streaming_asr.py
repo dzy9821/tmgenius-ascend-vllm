@@ -131,6 +131,20 @@ def asr_recognize(
 
 
 # ============================================================
+# 滑动窗口文本对齐
+# ============================================================
+
+
+def _find_overlap(prev_text: str, new_text: str) -> int:
+    """找 prev_text 的最长后缀与 new_text 前缀的精确匹配长度。"""
+    max_check = min(len(prev_text), len(new_text))
+    for k in range(max_check, 0, -1):
+        if prev_text[-k:] == new_text[:k]:
+            return k
+    return 0
+
+
+# ============================================================
 # 伪流式测试主逻辑
 # ============================================================
 
@@ -191,11 +205,9 @@ def run_pseudo_streaming(
     results: list[dict] = []
     t_total_start = time.monotonic()
 
-    # ---- 比例提交状态 ----
+    # ---- 对齐提交状态 ----
     committed_text = ""       # 已定稿的文本（不再变化）
-    prev_text = ""            # 上一个窗口的识别结果
-    prev_window_start = 0.0   # 上一个窗口的起始时间
-    prev_window_dur = 0.0     # 上一个窗口的实际时长
+    prev_text = ""            # 上一个窗口的识别结果（待定）
 
     for i in range(total_steps):
         # 窗口起止（向前取 window 秒，但不超过音频开头）
@@ -224,20 +236,17 @@ def run_pseudo_streaming(
             text = f"[ERROR: {exc}]"
         t_elapsed = (time.monotonic() - t_start) * 1000  # ms
 
-        # ---- 比例提交逻辑 ----
-        if not text.startswith("[ERROR"):
-            # 计算前一个窗口"滑出"了多少音频
-            uncovered = window_time_start - prev_window_start
-
-            if uncovered > 0 and prev_text and prev_window_dur > 0:
-                # 按比例提交前一个窗口的文本
-                commit_ratio = min(1.0, uncovered / prev_window_dur)
-                commit_chars = max(1, round(len(prev_text) * commit_ratio))
-                committed_text += prev_text[:commit_chars]
-
+        # ---- 后缀-前缀对齐提交 ----
+        if text and not text.startswith("[ERROR"):
+            if prev_text:
+                overlap = _find_overlap(prev_text, text)
+                if overlap > 0:
+                    # 提交 prev_text 中重叠之前的部分（不重叠 = 已滑出窗口）
+                    committed_text += prev_text[:-overlap]
+                else:
+                    # 完全没有重叠，prev_text 全部提交
+                    committed_text += prev_text
             prev_text = text
-            prev_window_start = window_time_start
-            prev_window_dur = window_dur
 
         # 当前展示文本 = 已提交 + 当前窗口待定
         display_text = committed_text + prev_text
