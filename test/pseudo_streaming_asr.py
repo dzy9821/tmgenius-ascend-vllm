@@ -72,6 +72,18 @@ def clean_asr_output(text: str) -> str:
     return "".join(part.strip() for part in parts if part.strip()).strip()
 
 
+# 匹配所有中英文标点符号
+_ALL_PUNCT_RE = re.compile(
+    r"[，。！？、；：\u201c\u201d\u2018\u2019（）【】《》——…\-\s"
+    r",.!?;:\"'()\[\]{}<>~`@#$%^&*_+=|/\\]+"
+)
+
+
+def strip_punctuation(text: str) -> str:
+    """去掉所有中英文标点符号，只保留纯文本。"""
+    return _ALL_PUNCT_RE.sub("", text)
+
+
 # ============================================================
 # ASR 调用（复用正式代码的 vLLM OpenAI 兼容接口方式）
 # ============================================================
@@ -117,7 +129,8 @@ def asr_recognize(
         messages=messages,
     )
     content = response.choices[0].message.content
-    return clean_asr_output(content if isinstance(content, str) else str(content))
+    text = clean_asr_output(content if isinstance(content, str) else str(content))
+    return strip_punctuation(text)
 
 
 # ============================================================
