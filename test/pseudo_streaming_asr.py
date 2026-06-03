@@ -1,20 +1,17 @@
 """
-伪流式 ASR 测试 —— 模拟实时流式识别。
+伪流式 ASR 测试 —— 滑动窗口模拟实时流式识别。
 
-将音频按 0.4 秒间隔分段，每次将 **累积到当前时刻的所有音频** 送入 ASR 推理，
-观察识别结果随音频增长的变化过程。
+每隔 0.4 秒步进，取 **2 秒窗口** 的音频送入 ASR 推理，
+相邻窗口重叠 1.6 秒。对重叠部分的识别结果进行去重拼接，
+输出最终的连续识别文本。
 
 用法：
     python test/pseudo_streaming_asr.py <wav_file> [options]
 
 示例：
     python test/pseudo_streaming_asr.py 120报警电话16k.wav
-    python test/pseudo_streaming_asr.py audio.wav --base-url http://127.0.0.1:15002/v1
-    python test/pseudo_streaming_asr.py audio.wav --chunk-mode incremental --interval 0.2
-
-模式说明：
-    cumulative  (默认) 每次发送从头到当前时刻的累积音频，观察增量识别变化
-    incremental         每次只发送当前 0.4s 片段，独立识别每段
+    python test/pseudo_streaming_asr.py audio.wav --window 3.0 --step 0.5
+    python test/pseudo_streaming_asr.py audio.wav --base-url http://10.0.0.1:28856/v1
 """
 
 from __future__ import annotations
@@ -26,7 +23,6 @@ import sys
 import time
 import base64
 import re
-from typing import Optional
 
 import numpy as np
 
@@ -125,81 +121,133 @@ def asr_recognize(
 
 
 # ============================================================
+# 滑动窗口去重拼接
+# ============================================================
+
+
+def merge_overlap_text(prev_text: str, new_text: str) -> str:
+    """对两段重叠窗口的识别结果去重拼接。
+
+    策略：找 prev_text 的最长后缀 == new_text 的前缀，
+    只追加 new_text 中不重叠的部分。
+    如果找不到重叠（可能模型输出不稳定），则直接拼接。
+    """
+    if not prev_text:
+        return new_text
+    if not new_text:
+        return prev_text
+
+    # 从最长可能的重叠开始，逐步缩短寻找匹配
+    max_overlap = min(len(prev_text), len(new_text))
+    for overlap_len in range(max_overlap, 0, -1):
+        if prev_text[-overlap_len:] == new_text[:overlap_len]:
+            return prev_text + new_text[overlap_len:]
+
+    # 没有精确匹配，尝试模糊匹配（去掉标点后比较）
+    _PUNCT_RE = re.compile(r"[，。！？、；：\u201c\u201d\u2018\u2019（）\s]")
+
+    prev_clean = _PUNCT_RE.sub("", prev_text)
+    new_clean = _PUNCT_RE.sub("", new_text)
+
+    max_overlap = min(len(prev_clean), len(new_clean))
+    for overlap_len in range(max_overlap, 0, -1):
+        if prev_clean[-overlap_len:] == new_clean[:overlap_len]:
+            # 找到模糊重叠，在原始 new_text 中定位对应位置
+            # 找到 new_clean[:overlap_len] 对应的原文结束位置
+            matched_clean_chars = 0
+            cut_pos = 0
+            for idx, ch in enumerate(new_text):
+                if _PUNCT_RE.match(ch):
+                    continue
+                matched_clean_chars += 1
+                if matched_clean_chars == overlap_len:
+                    cut_pos = idx + 1
+                    break
+            return prev_text + new_text[cut_pos:]
+
+    # 完全没有重叠，直接拼接
+    return prev_text + new_text
+
+
+# ============================================================
 # 伪流式测试主逻辑
 # ============================================================
 
 
 def run_pseudo_streaming(
     wav_path: str,
-    base_url: str = "http://127.0.0.1:15002/v1",
+    base_url: str = "http://localhost:28856/v1",
     api_key: str = "EMPTY",
-    model: str = "Qwen3-ASR-1.7B",
-    interval: float = 0.4,
+    model: str = "Qwen3-ASR-0.6B",
+    step: float = 0.4,
+    window: float = 2.0,
     context: str = "",
-    chunk_mode: str = "cumulative",
 ) -> None:
     """
-    伪流式 ASR 测试。
+    滑动窗口伪流式 ASR 测试。
+
+    每隔 step 秒取 window 秒的音频窗口送入 ASR 推理，
+    对重叠部分的识别结果去重后拼接为最终文本。
 
     Args:
         wav_path: WAV 文件路径
         base_url: vLLM API 地址
         api_key: API Key
         model: 模型名称
-        interval: 分段间隔（秒），默认 0.4s
+        step: 步进间隔（秒），默认 0.4s
+        window: 窗口大小（秒），默认 2.0s
         context: 热词/系统提示词
-        chunk_mode: "cumulative" 累积模式 | "incremental" 增量模式
     """
     # 加载音频
     audio, sr = load_wav(wav_path, target_sr=16000)
     total_duration = len(audio) / sr
-    chunk_samples = int(sr * interval)
-    total_chunks = (len(audio) + chunk_samples - 1) // chunk_samples
+    step_samples = int(sr * step)
+    window_samples = int(sr * window)
+    total_steps = (len(audio) + step_samples - 1) // step_samples
 
-    print("=" * 70)
-    print(f"  伪流式 ASR 测试")
-    print("=" * 70)
+    print("=" * 74)
+    print(f"  伪流式 ASR 测试（滑动窗口）")
+    print("=" * 74)
     print(f"  音频文件  : {wav_path}")
     print(f"  音频时长  : {total_duration:.2f}s")
     print(f"  采样率    : {sr} Hz")
-    print(f"  分段间隔  : {interval}s")
-    print(f"  总分段数  : {total_chunks}")
-    print(f"  识别模式  : {chunk_mode}")
+    print(f"  窗口大小  : {window}s")
+    print(f"  步进间隔  : {step}s")
+    print(f"  重叠比例  : {(window - step) / window * 100:.0f}%")
+    print(f"  总推理次数: {total_steps}")
     print(f"  模型      : {model}")
     print(f"  API 地址  : {base_url}")
     if context:
         print(f"  热词/提示 : {context}")
-    print("=" * 70)
+    print("=" * 74)
     print()
 
     # 创建客户端
     client = create_asr_client(base_url=base_url, api_key=api_key)
 
     results: list[dict] = []
+    merged_text = ""
     t_total_start = time.monotonic()
 
-    for i in range(total_chunks):
-        chunk_start_sample = i * chunk_samples
-        chunk_end_sample = min((i + 1) * chunk_samples, len(audio))
-        chunk_time_start = chunk_start_sample / sr
-        chunk_time_end = chunk_end_sample / sr
+    for i in range(total_steps):
+        # 窗口起止（向前取 window 秒，但不超过音频开头）
+        window_end_sample = min((i + 1) * step_samples, len(audio))
+        window_start_sample = max(0, window_end_sample - window_samples)
 
-        # 根据模式选择送入 ASR 的音频
-        if chunk_mode == "cumulative":
-            # 累积模式：从头到当前时刻
-            audio_to_recognize = audio[:chunk_end_sample]
-            mode_label = f"0.00s → {chunk_time_end:.2f}s"
-        else:
-            # 增量模式：只送当前片段
-            audio_to_recognize = audio[chunk_start_sample:chunk_end_sample]
-            mode_label = f"{chunk_time_start:.2f}s → {chunk_time_end:.2f}s"
+        window_time_start = window_start_sample / sr
+        window_time_end = window_end_sample / sr
+        window_dur = window_time_end - window_time_start
+        time_label = f"{window_time_start:.2f}s → {window_time_end:.2f}s"
+
+        # 取窗口音频
+        audio_window = audio[window_start_sample:window_end_sample]
 
         # ASR 推理
         t_start = time.monotonic()
         try:
             text = asr_recognize(
                 client=client,
-                audio_f32=audio_to_recognize,
+                audio_f32=audio_window,
                 sr=sr,
                 model=model,
                 context=context,
@@ -208,67 +256,73 @@ def run_pseudo_streaming(
             text = f"[ERROR: {exc}]"
         t_elapsed = (time.monotonic() - t_start) * 1000  # ms
 
+        # 去重拼接
+        if not text.startswith("[ERROR"):
+            prev_merged = merged_text
+            merged_text = merge_overlap_text(merged_text, text)
+            new_part = merged_text[len(prev_merged):]
+        else:
+            new_part = ""
+
         result = {
-            "chunk_id": i + 1,
-            "time_range": mode_label,
-            "audio_duration_ms": int((chunk_end_sample - (0 if chunk_mode == "cumulative" else chunk_start_sample)) / sr * 1000),
+            "step_id": i + 1,
+            "window_range": time_label,
+            "window_duration_ms": int(window_dur * 1000),
             "asr_latency_ms": round(t_elapsed, 1),
-            "text": text,
+            "raw_text": text,
+            "new_text": new_part,
+            "merged_so_far": merged_text,
         }
         results.append(result)
 
-        # 实时打印结果
+        # 实时打印
+        new_indicator = f" (+{new_part})" if new_part else ""
         print(
-            f"  [{i + 1:3d}/{total_chunks}]  "
-            f"时间={mode_label:>18s}  "
+            f"  [{i + 1:3d}/{total_steps}]  "
+            f"窗口={time_label:>20s}  "
+            f"({window_dur:.1f}s)  "
             f"耗时={t_elapsed:7.1f}ms  "
-            f"文本: {text}"
+            f"原文: {text}{new_indicator}"
         )
 
     t_total_elapsed = (time.monotonic() - t_total_start) * 1000
 
     # ---- 汇总报告 ----
     print()
-    print("=" * 70)
+    print("=" * 74)
     print("  汇总报告")
-    print("=" * 70)
+    print("=" * 74)
 
     latencies = [r["asr_latency_ms"] for r in results]
-    texts = [r["text"] for r in results if r["text"] and not r["text"].startswith("[ERROR")]
+    valid_count = sum(1 for r in results if not r["raw_text"].startswith("[ERROR"))
 
     print(f"  总耗时      : {t_total_elapsed:.0f}ms ({t_total_elapsed / 1000:.2f}s)")
     print(f"  音频时长    : {total_duration:.2f}s")
     print(f"  RTF         : {t_total_elapsed / 1000 / total_duration:.2f}")
-    print(f"  总分段数    : {total_chunks}")
-    print(f"  成功识别    : {len(texts)}/{total_chunks}")
+    print(f"  总推理次数  : {total_steps}")
+    print(f"  成功识别    : {valid_count}/{total_steps}")
     print(f"  平均延迟    : {sum(latencies) / len(latencies):.1f}ms")
     print(f"  最小延迟    : {min(latencies):.1f}ms")
     print(f"  最大延迟    : {max(latencies):.1f}ms")
     print()
-
-    if chunk_mode == "cumulative" and texts:
-        print("  最终识别结果:")
-        print(f"    {texts[-1]}")
-    elif chunk_mode == "incremental" and texts:
-        print("  拼接识别结果:")
-        full_text = "".join(texts)
-        print(f"    {full_text}")
-
+    print("  最终拼接结果:")
+    print(f"    {merged_text}")
     print()
-    print("=" * 70)
+    print("=" * 74)
 
-    # ---- 逐段明细 ----
+    # ---- 逐步明细 ----
     print()
-    print("  逐段明细:")
-    print(f"  {'段号':>4s}  {'时间范围':>18s}  {'音频ms':>7s}  {'延迟ms':>7s}  文本")
-    print("  " + "-" * 66)
+    print("  逐步明细:")
+    print(f"  {'步号':>4s}  {'窗口范围':>20s}  {'窗口ms':>6s}  {'延迟ms':>7s}  原文 → 新增部分")
+    print("  " + "-" * 72)
     for r in results:
+        new_part = f" → +「{r['new_text']}」" if r["new_text"] else ""
         print(
-            f"  {r['chunk_id']:4d}  "
-            f"{r['time_range']:>18s}  "
-            f"{r['audio_duration_ms']:7d}  "
+            f"  {r['step_id']:4d}  "
+            f"{r['window_range']:>20s}  "
+            f"{r['window_duration_ms']:6d}  "
             f"{r['asr_latency_ms']:7.1f}  "
-            f"{r['text']}"
+            f"{r['raw_text']}{new_part}"
         )
     print()
 
@@ -280,18 +334,18 @@ def run_pseudo_streaming(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="伪流式 ASR 测试：按固定间隔分段，逐段调用 ASR 推理",
+        description="伪流式 ASR 测试：滑动窗口方式，每步发送固定窗口音频并去重拼接结果",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 默认累积模式，每 0.4s 推理一次
+  # 默认：2s 窗口，0.4s 步进
   python test/pseudo_streaming_asr.py 120报警电话16k.wav
 
-  # 增量模式，每段独立识别
-  python test/pseudo_streaming_asr.py audio.wav --chunk-mode incremental
+  # 自定义窗口和步进
+  python test/pseudo_streaming_asr.py audio.wav --window 3.0 --step 0.5
 
-  # 自定义间隔和 API 地址
-  python test/pseudo_streaming_asr.py audio.wav --interval 0.2 --base-url http://10.0.0.1:15002/v1
+  # 自定义 API 地址
+  python test/pseudo_streaming_asr.py audio.wav --base-url http://10.0.0.1:28856/v1
         """,
     )
     parser.add_argument(
@@ -300,8 +354,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("VLLM_API_BASE", "http://127.0.0.1:15002/v1"),
-        help="vLLM API 地址 (默认: http://127.0.0.1:15002/v1)",
+        default=os.getenv("VLLM_API_BASE", "http://localhost:28856/v1"),
+        help="vLLM API 地址 (默认: http://localhost:28856/v1)",
     )
     parser.add_argument(
         "--api-key",
@@ -310,23 +364,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("VLLM_MODEL_NAME", "Qwen3-ASR-1.7B"),
-        help="模型名称 (默认: Qwen3-ASR-1.7B)",
+        default=os.getenv("VLLM_MODEL_NAME", "Qwen3-ASR-0.6B"),
+        help="模型名称 (默认: Qwen3-ASR-0.6B)",
     )
     parser.add_argument(
-        "--interval", type=float, default=0.4,
-        help="分段间隔秒数 (默认: 0.4)",
+        "--step", type=float, default=0.4,
+        help="步进间隔秒数 (默认: 0.4)",
+    )
+    parser.add_argument(
+        "--window", type=float, default=2.0,
+        help="窗口大小秒数 (默认: 2.0)",
     )
     parser.add_argument(
         "--context",
         default="",
         help="热词/系统提示词，如 '热词：张三丰、武当山'",
-    )
-    parser.add_argument(
-        "--chunk-mode",
-        choices=["cumulative", "incremental"],
-        default="cumulative",
-        help="识别模式: cumulative=累积(默认) | incremental=增量",
     )
 
     args = parser.parse_args()
@@ -335,14 +387,18 @@ def main() -> None:
         print(f"ERROR: 文件不存在: {args.wav}")
         sys.exit(1)
 
+    if args.window < args.step:
+        print(f"ERROR: 窗口大小 ({args.window}s) 不能小于步进间隔 ({args.step}s)")
+        sys.exit(1)
+
     run_pseudo_streaming(
         wav_path=args.wav,
         base_url=args.base_url,
         api_key=args.api_key,
         model=args.model,
-        interval=args.interval,
+        step=args.step,
+        window=args.window,
         context=args.context,
-        chunk_mode=args.chunk_mode,
     )
 
 
