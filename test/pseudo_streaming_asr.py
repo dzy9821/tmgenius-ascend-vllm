@@ -72,6 +72,15 @@ def clean_asr_output(text: str) -> str:
     return "".join(part.strip() for part in parts if part.strip()).strip()
 
 
+# 匹配非中文字符
+_NON_CHINESE_RE = re.compile(r"[^\u4e00-\u9fff]+")
+
+
+def strip_punctuation(text: str) -> str:
+    """只保留中文字符，去掉其他所有内容。"""
+    return _NON_CHINESE_RE.sub("", text)
+
+
 # ============================================================
 # ASR 调用（异步版本，使用 AsyncOpenAI）
 # ============================================================
@@ -116,7 +125,8 @@ async def asr_recognize(
         messages=messages,
     )
     content = response.choices[0].message.content
-    return clean_asr_output(content if isinstance(content, str) else str(content))
+    text = clean_asr_output(content if isinstance(content, str) else str(content))
+    return strip_punctuation(text)
 
 
 # ============================================================
@@ -260,6 +270,13 @@ async def run_pseudo_streaming(
         current += delta
         max_inflight = max(max_inflight, current)
     print(f"  最大并发    : {max_inflight}")
+
+    # 按步号顺序拼接最终文本
+    sorted_results = sorted(results, key=lambda r: r["step_id"])
+    final_text = "".join(r["raw_text"] for r in sorted_results if not r["raw_text"].startswith("[ERROR"))
+    print()
+    print("  最终拼接结果:")
+    print(f"    {final_text}")
     print()
     print("=" * 74)
 
