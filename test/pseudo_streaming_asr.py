@@ -1,9 +1,8 @@
 """
-伪流式 ASR 测试 —— 滑动窗口模拟实时流式识别。
+伪流式 ASR 测试 —— 滑动窗口模拟实时流式识别（异步版）。
 
-每隔 0.4 秒步进，取 **2 秒窗口** 的音频送入 ASR 推理，
-相邻窗口重叠 1.6 秒。对重叠部分的识别结果进行去重拼接，
-输出最终的连续识别文本。
+按真实时间节奏每隔 step 秒发出一个窗口请求（不等前一个返回），
+结果按实际返回顺序展示。
 
 用法：
     python test/pseudo_streaming_asr.py <wav_file> [options]
@@ -17,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import os
 import sys
@@ -72,41 +72,31 @@ def clean_asr_output(text: str) -> str:
     return "".join(part.strip() for part in parts if part.strip()).strip()
 
 
-# 匹配非中文字符
-_NON_CHINESE_RE = re.compile(r"[^\u4e00-\u9fff]+")
-
-
-def strip_punctuation(text: str) -> str:
-    """只保留中文字符，去掉其他所有内容。"""
-    return _NON_CHINESE_RE.sub("", text)
-
-
 # ============================================================
-# ASR 调用（复用正式代码的 vLLM OpenAI 兼容接口方式）
+# ASR 调用（异步版本，使用 AsyncOpenAI）
 # ============================================================
 
 
-def create_asr_client(base_url: str, api_key: str = "EMPTY"):
-    """创建 OpenAI 兼容客户端。"""
+def create_async_asr_client(base_url: str, api_key: str = "EMPTY"):
+    """创建异步 OpenAI 兼容客户端。"""
     import httpx
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
-    # 清除代理环境变量
     for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(key, None)
 
-    http_client = httpx.Client(trust_env=False)
-    return OpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
+    http_client = httpx.AsyncClient(trust_env=False)
+    return AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
 
 
-def asr_recognize(
+async def asr_recognize(
     client,
     audio_f32: np.ndarray,
     sr: int,
     model: str,
     context: str = "",
 ) -> str:
-    """调用 vLLM ASR 接口识别音频。"""
+    """异步调用 vLLM ASR 接口识别音频。"""
     data_url = encode_audio_to_data_url(audio_f32, sr)
 
     messages: list[dict] = []
@@ -121,35 +111,20 @@ def asr_recognize(
         }
     )
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=messages,
     )
     content = response.choices[0].message.content
-    text = clean_asr_output(content if isinstance(content, str) else str(content))
-    return strip_punctuation(text)
+    return clean_asr_output(content if isinstance(content, str) else str(content))
 
 
 # ============================================================
-# 滑动窗口文本对齐
+# 伪流式测试主逻辑（异步版）
 # ============================================================
 
 
-def _find_overlap(prev_text: str, new_text: str) -> int:
-    """找 prev_text 的最长后缀与 new_text 前缀的精确匹配长度。"""
-    max_check = min(len(prev_text), len(new_text))
-    for k in range(max_check, 0, -1):
-        if prev_text[-k:] == new_text[:k]:
-            return k
-    return 0
-
-
-# ============================================================
-# 伪流式测试主逻辑
-# ============================================================
-
-
-def run_pseudo_streaming(
+async def run_pseudo_streaming(
     wav_path: str,
     base_url: str = "http://localhost:28856/v1",
     api_key: str = "EMPTY",
@@ -159,23 +134,11 @@ def run_pseudo_streaming(
     context: str = "",
 ) -> None:
     """
-    滑动窗口伪流式 ASR 测试。
+    滑动窗口伪流式 ASR 测试（异步版）。
 
-    策略（比例提交法）：
-      - 每次窗口滑动时，前一个窗口"滑出"的音频比例对应的文本被提交（定稿）
-      - 当前窗口的完整识别结果作为"待定"文本，随时被下一个窗口替换
-      - 最后一个窗口的剩余文本全部提交
-
-    Args:
-        wav_path: WAV 文件路径
-        base_url: vLLM API 地址
-        api_key: API Key
-        model: 模型名称
-        step: 步进间隔（秒），默认 0.4s
-        window: 窗口大小（秒），默认 2.0s
-        context: 热词/系统提示词
+    按真实时间节奏每隔 step 秒发出请求，不等前一个返回。
+    结果按实际返回先后顺序展示。
     """
-    # 加载音频
     audio, sr = load_wav(wav_path, target_sr=16000)
     total_duration = len(audio) / sr
     step_samples = int(sr * step)
@@ -183,7 +146,7 @@ def run_pseudo_streaming(
     total_steps = (len(audio) + step_samples - 1) // step_samples
 
     print("=" * 74)
-    print("  伪流式 ASR 测试（滑动窗口 · 比例提交）")
+    print("  伪流式 ASR 测试（滑动窗口 · 异步实时调度）")
     print("=" * 74)
     print(f"  音频文件  : {wav_path}")
     print(f"  音频时长  : {total_duration:.2f}s")
@@ -199,33 +162,26 @@ def run_pseudo_streaming(
     print("=" * 74)
     print()
 
-    # 创建客户端
-    client = create_asr_client(base_url=base_url, api_key=api_key)
+    client = create_async_asr_client(base_url=base_url, api_key=api_key)
 
     results: list[dict] = []
-    t_total_start = time.monotonic()
+    results_lock = asyncio.Lock()
+    t_global_start = time.monotonic()
 
-    # ---- 对齐提交状态 ----
-    committed_text = ""       # 已定稿的文本（不再变化）
-    prev_text = ""            # 上一个窗口的识别结果（待定）
-
-    for i in range(total_steps):
-        # 窗口起止（向前取 window 秒，但不超过音频开头）
-        window_end_sample = min((i + 1) * step_samples, len(audio))
+    async def _recognize_one(step_id: int):
+        """单个窗口的识别任务，完成后立即打印。"""
+        window_end_sample = min((step_id + 1) * step_samples, len(audio))
         window_start_sample = max(0, window_end_sample - window_samples)
-
         window_time_start = window_start_sample / sr
         window_time_end = window_end_sample / sr
         window_dur = window_time_end - window_time_start
         time_label = f"{window_time_start:.2f}s → {window_time_end:.2f}s"
-
-        # 取窗口音频
         audio_window = audio[window_start_sample:window_end_sample]
 
-        # ASR 推理
+        t_send = time.monotonic() - t_global_start
         t_start = time.monotonic()
         try:
-            text = asr_recognize(
+            text = await asr_recognize(
                 client=client,
                 audio_f32=audio_window,
                 sr=sr,
@@ -234,47 +190,45 @@ def run_pseudo_streaming(
             )
         except Exception as exc:
             text = f"[ERROR: {exc}]"
-        t_elapsed = (time.monotonic() - t_start) * 1000  # ms
-
-        # ---- 后缀-前缀对齐提交 ----
-        if text and not text.startswith("[ERROR"):
-            if prev_text:
-                overlap = _find_overlap(prev_text, text)
-                if overlap > 0:
-                    # 提交 prev_text 中重叠之前的部分（不重叠 = 已滑出窗口）
-                    committed_text += prev_text[:-overlap]
-                else:
-                    # 完全没有重叠，prev_text 全部提交
-                    committed_text += prev_text
-            prev_text = text
-
-        # 当前展示文本 = 已提交 + 当前窗口待定
-        display_text = committed_text + prev_text
+        t_elapsed = (time.monotonic() - t_start) * 1000
+        t_recv = time.monotonic() - t_global_start
 
         result = {
-            "step_id": i + 1,
+            "step_id": step_id + 1,
             "window_range": time_label,
             "window_duration_ms": int(window_dur * 1000),
             "asr_latency_ms": round(t_elapsed, 1),
+            "send_time": round(t_send, 3),
+            "recv_time": round(t_recv, 3),
             "raw_text": text,
-            "committed": committed_text,
-            "display": display_text,
         }
-        results.append(result)
 
-        # 实时打印：展示已累积的拼接文本
-        print(
-            f"  [{i + 1:3d}/{total_steps}]  "
-            f"窗口={time_label:>20s}  "
-            f"耗时={t_elapsed:7.1f}ms"
-        )
-        print(f"             累积文本: {display_text}")
+        async with results_lock:
+            arrival_idx = len(results) + 1
+            results.append(result)
+            print(
+                f"  [返回 {arrival_idx:3d}/{total_steps}]  "
+                f"步号={step_id + 1:3d}  "
+                f"窗口={time_label:>20s}  "
+                f"发送={t_send:6.2f}s  "
+                f"返回={t_recv:6.2f}s  "
+                f"耗时={t_elapsed:7.1f}ms"
+            )
+            print(f"             识别文本: {text}")
 
-    # 最后一个窗口的剩余文本全部提交
-    committed_text += prev_text
-    final_text = committed_text
+    # 按真实时间调度：每隔 step 秒发射一个任务
+    tasks: list[asyncio.Task] = []
+    for i in range(total_steps):
+        scheduled_time = i * step
+        now = time.monotonic() - t_global_start
+        wait = scheduled_time - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        tasks.append(asyncio.create_task(_recognize_one(i)))
 
-    t_total_elapsed = (time.monotonic() - t_total_start) * 1000
+    await asyncio.gather(*tasks)
+
+    t_total_elapsed = (time.monotonic() - t_global_start) * 1000
 
     # ---- 汇总报告 ----
     print()
@@ -283,31 +237,48 @@ def run_pseudo_streaming(
     print("=" * 74)
 
     latencies = [r["asr_latency_ms"] for r in results]
-    valid_count = sum(1 for r in results if not r["raw_text"].startswith("[ERROR"))
+    valid = sum(1 for r in results if not r["raw_text"].startswith("[ERROR"))
 
     print(f"  总耗时      : {t_total_elapsed:.0f}ms ({t_total_elapsed / 1000:.2f}s)")
     print(f"  音频时长    : {total_duration:.2f}s")
     print(f"  RTF         : {t_total_elapsed / 1000 / total_duration:.2f}")
     print(f"  总推理次数  : {total_steps}")
-    print(f"  成功识别    : {valid_count}/{total_steps}")
+    print(f"  成功识别    : {valid}/{total_steps}")
     print(f"  平均延迟    : {sum(latencies) / len(latencies):.1f}ms")
     print(f"  最小延迟    : {min(latencies):.1f}ms")
     print(f"  最大延迟    : {max(latencies):.1f}ms")
-    print()
-    print("  最终拼接结果:")
-    print(f"    {final_text}")
+
+    # 最大同时在飞请求数
+    events = []
+    for r in results:
+        events.append((r["send_time"], +1))
+        events.append((r["recv_time"], -1))
+    events.sort()
+    max_inflight = 0
+    current = 0
+    for _, delta in events:
+        current += delta
+        max_inflight = max(max_inflight, current)
+    print(f"  最大并发    : {max_inflight}")
     print()
     print("=" * 74)
 
-    # ---- 逐步明细 ----
+    # ---- 逐步明细（按返回顺序） ----
     print()
-    print("  逐步明细:")
-    print(f"  {'步号':>4s}  {'窗口范围':>20s}  {'延迟ms':>7s}  窗口原文")
-    print("  " + "-" * 72)
-    for r in results:
+    print("  逐步明细（按实际返回顺序）:")
+    header = (
+        f"  {'序号':>4s}  {'步号':>4s}  {'窗口范围':>20s}  "
+        f"{'发送':>7s}  {'返回':>7s}  {'延迟ms':>7s}  识别文本"
+    )
+    print(header)
+    print("  " + "-" * 85)
+    for idx, r in enumerate(results, 1):
         print(
-            f"  {r['step_id']:4d}  "
+            f"  {idx:4d}  "
+            f"{r['step_id']:4d}  "
             f"{r['window_range']:>20s}  "
+            f"{r['send_time']:6.2f}s  "
+            f"{r['recv_time']:6.2f}s  "
             f"{r['asr_latency_ms']:7.1f}  "
             f"{r['raw_text']}"
         )
@@ -321,7 +292,7 @@ def run_pseudo_streaming(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="伪流式 ASR 测试：滑动窗口方式，每步发送固定窗口音频并去重拼接结果",
+        description="伪流式 ASR 测试：滑动窗口 + 异步实时调度，结果按返回顺序展示",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -378,14 +349,16 @@ def main() -> None:
         print(f"ERROR: 窗口大小 ({args.window}s) 不能小于步进间隔 ({args.step}s)")
         sys.exit(1)
 
-    run_pseudo_streaming(
-        wav_path=args.wav,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        model=args.model,
-        step=args.step,
-        window=args.window,
-        context=args.context,
+    asyncio.run(
+        run_pseudo_streaming(
+            wav_path=args.wav,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            step=args.step,
+            window=args.window,
+            context=args.context,
+        )
     )
 
 
