@@ -72,16 +72,13 @@ def clean_asr_output(text: str) -> str:
     return "".join(part.strip() for part in parts if part.strip()).strip()
 
 
-# 匹配所有中英文标点符号
-_ALL_PUNCT_RE = re.compile(
-    r"[，。！？、；：\u201c\u201d\u2018\u2019（）【】《》——…\-\s"
-    r",.!?;:\"'()\[\]{}<>~`@#$%^&*_+=|/\\]+"
-)
+# 匹配非中文字符
+_NON_CHINESE_RE = re.compile(r"[^\u4e00-\u9fff]+")
 
 
 def strip_punctuation(text: str) -> str:
-    """去掉所有中英文标点符号，只保留纯文本。"""
-    return _ALL_PUNCT_RE.sub("", text)
+    """只保留中文字符，去掉其他所有内容。"""
+    return _NON_CHINESE_RE.sub("", text)
 
 
 # ============================================================
