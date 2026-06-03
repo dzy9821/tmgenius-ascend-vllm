@@ -210,7 +210,8 @@ services:
 
     ports:
       - "8856:8856"    # ASR WebSocket（宿主 18856 → 容器 8856）
-      - "15002:15002"   # vLLM 推理服务
+      - "15002:15002"  # 1.7B vLLM 推理服务
+      - "15003:15003"  # 0.6B vLLM 推理服务（progressive）
 
     volumes:
       - /usr/local/dcmi:/usr/local/dcmi:ro
@@ -219,6 +220,7 @@ services:
       - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro
       - /etc/ascend_install.info:/etc/ascend_install.info:ro
       - ./weights/Qwen3-ASR-1.7B:/weights/Qwen3-ASR-1.7B:ro
+      - ./weights/Qwen3-ASR-0.6B:/weights/Qwen3-ASR-0.6B:ro
 
     environment:
       # ---- NPU 设备可见性 ----
@@ -256,6 +258,14 @@ services:
       VAD_DYNAMIC_RANGE_END: "20.0"
       VAD_MIN_SPEECH: "0.52"
       VAD_MAX_SPEECH: "30.0"
+      # ---- Progressive 伪流式 ----
+      PROGRESSIVE_ENABLED: "true"
+      PROGRESSIVE_STEP: "0.6"
+      PROGRESSIVE_VLLM_PORT: "15003"
+      PROGRESSIVE_VLLM_MODEL_PATH: "/weights/Qwen3-ASR-0.6B"
+      PROGRESSIVE_MODEL_NAME: "Qwen3-ASR-0.6B"
+      PROGRESSIVE_HEALTH_CHECK_INTERVAL: "5"
+      PROGRESSIVE_STARTUP_TIMEOUT: "1200"
 
     devices:
       - /dev/davinci2

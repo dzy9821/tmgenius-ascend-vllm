@@ -30,17 +30,19 @@ class ASRError(Exception):
 class ASRService:
     """异步 ASR 推理服务，封装对 vLLM 的 HTTP 调用。"""
 
-    def __init__(self) -> None:
+    def __init__(self, api_base: str | None = None, model_name: str | None = None) -> None:
         self._client: Optional[httpx.AsyncClient] = None
+        self._api_base = api_base or settings.VLLM_API_BASE
+        self._model_name = model_name or settings.VLLM_MODEL_NAME
 
     async def startup(self) -> None:
         """初始化 HTTP 客户端（应用启动时调用）。"""
         # 显式禁用代理，等同于 unset http_proxy/https_proxy
         self._client = httpx.AsyncClient(timeout=60.0, proxy=None, trust_env=False)
         logger.info(
-            "ASR service started, vLLM endpoint: %s, model: %s",
-            settings.VLLM_API_BASE,
-            settings.VLLM_MODEL_NAME,
+            "ASR service started, endpoint: %s, model: %s",
+            self._api_base,
+            self._model_name,
         )
 
     async def shutdown(self) -> None:
@@ -86,9 +88,9 @@ class ASRService:
             }
         )
 
-        url = f"{settings.VLLM_API_BASE}/chat/completions"
+        url = f"{self._api_base}/chat/completions"
         payload = {
-            "model": settings.VLLM_MODEL_NAME,
+            "model": self._model_name,
             "messages": messages,
         }
         headers = {}
@@ -126,7 +128,7 @@ class ASRService:
         if self._client is None:
             return False
         try:
-            resp = await self._client.get(f"{settings.VLLM_API_BASE}/models", timeout=5.0)
+            resp = await self._client.get(f"{self._api_base}/models", timeout=5.0)
             return resp.status_code == 200
         except Exception:
             return False

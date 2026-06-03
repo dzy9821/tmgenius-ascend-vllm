@@ -10,6 +10,8 @@ import random
 import string
 import time
 
+import numpy as np
+
 from src.core.config import settings
 from src.services.asr_service import build_hotword_context
 from src.services.vad_service import TenVADSession
@@ -75,6 +77,14 @@ class ASRSession:
         # ---- 握手帧携带的首帧音频 ----
         self._first_audio_payload = None  # type: ignore
 
+        # ---- 伪流式 Progressive 状态 ----
+        self._progressive_seg_id: int = 0                      # progressive 独立 segId 计数器
+        self._progressive_task: asyncio.Task | None = None      # 当前进行中的 progressive 任务
+        self._progressive_audio_frames: list[np.ndarray] = []   # 自上次发送以来累积的语音帧（片段模式，非全量）
+        self._progressive_total_samples: int = 0                # 缓冲区内累计采样数
+        self._progressive_start_sample: int = 0                 # 缓冲区首帧对应的全局采样偏移
+        self._progressive_last_send_time: float = 0.0           # 上一次发起 progressive 的时间（0 = 未开始）
+
         # ---- 音频到达延时诊断 ----
         self._connection_start_time: float = 0.0  # 流式开始时刻 (time.monotonic)
         self._accumulated_audio_samples: int = 0  # 累计收到的音频采样数
@@ -117,12 +127,60 @@ class ASRSession:
         self._pending_asr_tasks.clear()
 
     def close(self) -> None:
-        """释放资源：取消后台任务 + 从 VAD 批处理器注销 + 销毁 Opus 解码器。"""
+        """释放资源：取消后台任务 + 取消 progressive + 从 VAD 注销 + 销毁 Opus 解码器。"""
         self.cancel_pending_asr()
+        self.cancel_progressive()
         self.vad.close()
         if self._opus_decoder is not None:
             self._opus_decoder.close()
             self._opus_decoder = None
+
+    # ---- 伪流式 Progressive 状态管理 ----
+
+    def append_progressive_audio(self, frame: np.ndarray, frame_start_sample: int) -> None:
+        """追加一帧到 progressive 片段缓冲。
+
+        当缓冲区为空时（新语音段开始或上次发送后重置），自动记录起始时间和采样位置，
+        解决首次 progressive 因 _progressive_last_send_time=0 立即触发的问题。
+        """
+        if not self._progressive_audio_frames:
+            self._progressive_last_send_time = time.monotonic()
+            self._progressive_start_sample = frame_start_sample
+        self._progressive_audio_frames.append(frame)
+        self._progressive_total_samples += len(frame)
+
+    def pop_progressive_audio(self) -> tuple[np.ndarray, int, int]:
+        """取出当前累积的片段音频，返回 (audio_int16, start_sample, end_sample)，并重置缓冲区。"""
+        if not self._progressive_audio_frames:
+            return np.array([], dtype=np.int16), 0, 0
+        audio = np.concatenate(self._progressive_audio_frames)
+        start_sample = self._progressive_start_sample
+        end_sample = start_sample + self._progressive_total_samples
+        self._progressive_audio_frames = []
+        self._progressive_total_samples = 0
+        self._progressive_start_sample = 0
+        self._progressive_last_send_time = time.monotonic()
+        return audio, start_sample, end_sample
+
+    def next_progressive_seg_id(self) -> int:
+        """获取并递增 progressive 独立 segId。"""
+        current = self._progressive_seg_id
+        self._progressive_seg_id += 1
+        return current
+
+    def cancel_progressive(self) -> None:
+        """取消进行中的 progressive 任务，清空片段缓冲区，重置 segId。
+
+        VAD 断句时和连接关闭时调用，确保新语音段从头开始。
+        """
+        if self._progressive_task is not None and not self._progressive_task.done():
+            self._progressive_task.cancel()
+        self._progressive_task = None
+        self._progressive_audio_frames = []
+        self._progressive_total_samples = 0
+        self._progressive_start_sample = 0
+        self._progressive_last_send_time = 0.0
+        self._progressive_seg_id = 0
 
     def next_seg_id(self) -> int:
         """获取当前段号并递增。"""

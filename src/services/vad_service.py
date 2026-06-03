@@ -84,6 +84,18 @@ class TenVADSession:
         self._speech_start_sample: int = 0
         self._last_speech_end_sample: int = 0
 
+    # ---- 公开属性 ----
+
+    @property
+    def in_speech(self) -> bool:
+        """当前是否处于语音段中（供 progressive 调度使用）。"""
+        return self._in_speech
+
+    @property
+    def speech_start_sample(self) -> int:
+        """当前语音段起始采样位置（供 progressive bg/ed 计算）。"""
+        return self._speech_start_sample
+
     # ---- 公开接口 ----
 
     async def feed_audio(self, pcm_int16: np.ndarray) -> list[dict]:

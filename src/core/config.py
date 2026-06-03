@@ -60,6 +60,41 @@ class Settings:
     ASR_PAD_FRAMES: int = int(os.getenv("ASR_PAD_FRAMES", "5"))
     """送给 ASR 时首尾各附加的真实音频上下文帧数（帧长 = VAD_HOP_SIZE samples），替代静默填充。"""
 
+    # ---- 伪流式 Progressive ----
+    PROGRESSIVE_ENABLED: bool = os.getenv("PROGRESSIVE_ENABLED", "false").lower() == "true"
+    """是否启用伪流式 progressive 推理。"""
+
+    PROGRESSIVE_STEP: float = float(os.getenv("PROGRESSIVE_STEP", "0.6"))
+    """progressive 推理步进间隔（秒）。"""
+
+    # Progressive vLLM 子进程启动参数（与 1.7B 参数一致，仅端口和模型不同）
+    PROGRESSIVE_VLLM_PORT: int = int(os.getenv("PROGRESSIVE_VLLM_PORT", "15003"))
+    """0.6B vLLM 子进程监听端口。"""
+
+    PROGRESSIVE_VLLM_MODEL_PATH: str = os.getenv(
+        "PROGRESSIVE_VLLM_MODEL_PATH", "/weights/Qwen3-ASR-0.6B"
+    )
+    """0.6B 模型权重路径。"""
+
+    PROGRESSIVE_MODEL_NAME: str = os.getenv("PROGRESSIVE_MODEL_NAME", "Qwen3-ASR-0.6B")
+    """0.6B 模型 served-model-name。"""
+
+    PROGRESSIVE_API_BASE: str = os.getenv(
+        "PROGRESSIVE_API_BASE",
+        f"http://127.0.0.1:{PROGRESSIVE_VLLM_PORT}/v1",
+    )
+    """0.6B vLLM 的 API 地址。"""
+
+    PROGRESSIVE_HEALTH_CHECK_INTERVAL: float = float(
+        os.getenv("PROGRESSIVE_HEALTH_CHECK_INTERVAL", "5")
+    )
+    """0.6B vLLM 健康检查间隔（秒）。"""
+
+    PROGRESSIVE_STARTUP_TIMEOUT: int = int(
+        os.getenv("PROGRESSIVE_STARTUP_TIMEOUT", "1200")
+    )
+    """0.6B vLLM 启动超时（秒）。"""
+
     # ---- VAD 动态断句阈值 ----
     VAD_HOP_SIZE: int = int(os.getenv("VAD_HOP_SIZE", "640"))
     """VAD 帧长（采样数），16kHz 下 640 = 40ms，对齐客户端发送间隔。"""

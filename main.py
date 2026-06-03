@@ -27,103 +27,174 @@ os.environ.setdefault("UVICORN_WS_PING_TIMEOUT", str(int(settings.WS_PING_TIMEOU
 from src.api.health import router as health_router
 from src.api.metrics import router as metrics_router
 from src.api.websocket import asr_service, itn_pool, router as ws_router
+import src.api.websocket as ws_module
 from src.core.logging import get_logger, setup_logging
+from src.services.asr_service import ASRService
 
 setup_logging()
 logger = get_logger(__name__)
 
 
-class VLLMManager:
-    """vLLM 子进程生命周期管理。"""
+class VLLMInstance:
+    """单个 vLLM 子进程的配置和状态。"""
 
-    process: ClassVar[subprocess.Popen | None] = None
+    def __init__(self, port: int, model_path: str, model_name: str) -> None:
+        self.port = port
+        self.model_path = model_path
+        self.model_name = model_name
+        self.process: subprocess.Popen | None = None
+
+    def health_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/v1/models"
+
+    def build_cmd(
+        self,
+        tensor_parallel_size: int,
+        max_model_len: int,
+        gpu_memory_utilization: float,
+        extra_args: str,
+    ) -> list[str]:
+        """构建 vllm serve 命令行，与 1.7B 使用完全相同的参数模板。"""
+        cmd = [
+            "vllm", "serve", self.model_path,
+            "--served-model-name", self.model_name,
+            "--tensor-parallel-size", str(tensor_parallel_size),
+            "--max-model-len", str(max_model_len),
+            "--gpu-memory-utilization", str(gpu_memory_utilization),
+            "--port", str(self.port),
+        ]
+        if extra_args:
+            cmd.extend(extra_args.split())
+        return cmd
+
+
+class VLLMManager:
+    """vLLM 子进程生命周期管理（支持 1.7B + 0.6B 双实例）。"""
+
+    primary: ClassVar[VLLMInstance | None] = None    # 1.7B
+    progressive: ClassVar[VLLMInstance | None] = None  # 0.6B
 
     @classmethod
-    def start(cls) -> bool:
-        """启动 vLLM 推理服务子进程，阻塞等待就绪。"""
-        if cls.process is not None and cls.process.poll() is None:
-            logger.info("vLLM process already running")
+    def _start_instance(cls, instance: VLLMInstance, name: str) -> bool:
+        """启动单个 vLLM 实例，阻塞等待就绪。
+
+        启动日志格式与原有 1.7B 单实例保持一致。
+        """
+        if instance.process is not None and instance.process.poll() is None:
+            logger.info("vLLM (%s) process already running: port=%d", name, instance.port)
             return True
 
-        cmd = [
-            "vllm", "serve", settings.VLLM_MODEL_PATH,
-            "--served-model-name", settings.VLLM_MODEL_NAME,
-            "--tensor-parallel-size", str(settings.VLLM_TENSOR_PARALLEL_SIZE),
-            "--max-model-len", str(settings.VLLM_MAX_MODEL_LEN),
-            "--gpu-memory-utilization", str(settings.VLLM_GPU_MEMORY_UTILIZATION),
-            "--port", str(settings.VLLM_PORT),
-        ]
-
-        if settings.VLLM_EXTRA_ARGS:
-            cmd.extend(settings.VLLM_EXTRA_ARGS.split())
-
-        logger.info("Starting vLLM: %s", " ".join(cmd))
+        cmd = instance.build_cmd(
+            settings.VLLM_TENSOR_PARALLEL_SIZE,
+            settings.VLLM_MAX_MODEL_LEN,
+            settings.VLLM_GPU_MEMORY_UTILIZATION,
+            settings.VLLM_EXTRA_ARGS,
+        )
+        logger.info("Starting vLLM (%s): %s", name, " ".join(cmd))
 
         try:
-            cls.process = subprocess.Popen(
-                cmd,
-                preexec_fn=os.setsid,
-            )
-            logger.info("vLLM started, PID: %d", cls.process.pid)
+            instance.process = subprocess.Popen(cmd, preexec_fn=os.setsid)
+            logger.info("vLLM (%s) started, PID: %d", name, instance.process.pid)
         except Exception:
-            logger.exception("Failed to start vLLM")
+            logger.exception("Failed to start vLLM (%s)", name)
             return False
 
-        # 阻塞等待 vLLM API 就绪
-        health_url = f"http://127.0.0.1:{settings.VLLM_PORT}/v1/models"
-        timeout = settings.VLLM_STARTUP_TIMEOUT
+        timeout = (settings.PROGRESSIVE_STARTUP_TIMEOUT
+                   if instance.port == settings.PROGRESSIVE_VLLM_PORT
+                   else settings.VLLM_STARTUP_TIMEOUT)
+        health_url = instance.health_url()
         deadline = time.monotonic() + timeout
 
-        logger.info("Waiting for vLLM at %s (timeout=%ds)...", health_url, timeout)
+        logger.info("Waiting for vLLM (%s) at %s (timeout=%ds)...", name, health_url, timeout)
         while time.monotonic() < deadline:
-            if cls.process.poll() is not None:
-                logger.error("vLLM exited with code %d", cls.process.returncode)
+            if instance.process.poll() is not None:
+                logger.error("vLLM (%s) exited with code %d", name, instance.process.returncode)
                 return False
             try:
                 r = httpx.get(health_url, timeout=2)
                 if r.status_code == 200:
                     elapsed = timeout - (deadline - time.monotonic())
-                    logger.info("vLLM is ready (took %.1fs)", elapsed)
+                    logger.info("vLLM (%s) is ready (took %.1fs)", name, elapsed)
                     return True
             except Exception:
                 pass
             time.sleep(2)
 
-        logger.error("vLLM did not become ready within %ds", timeout)
-        cls.stop()
+        logger.error("vLLM (%s) did not become ready within %ds", name, timeout)
+        cls._stop_instance(instance, name)
         return False
 
     @classmethod
-    def stop(cls) -> None:
-        """关闭 vLLM 子进程及其整个进程组。"""
-        if cls.process is None:
+    def _stop_instance(cls, instance: VLLMInstance, name: str) -> None:
+        """关闭单个 vLLM 实例及其进程组。"""
+        if instance.process is None:
             return
         try:
-            pgid = os.getpgid(cls.process.pid)
+            pgid = os.getpgid(instance.process.pid)
         except OSError:
-            cls.process = None
+            instance.process = None
             return
-        logger.info("Stopping vLLM process group (PGID %d)...", pgid)
+        logger.info("Stopping vLLM (%s) process group (PGID %d)...", name, pgid)
         try:
             os.killpg(pgid, signal.SIGTERM)
         except OSError:
             pass
         try:
-            cls.process.wait(timeout=15)
+            instance.process.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            logger.warning("vLLM did not stop, killing process group...")
+            logger.warning("vLLM (%s) did not stop, killing...", name)
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except OSError:
                 pass
-            cls.process.wait()
-        cls.process = None
-        logger.info("vLLM stopped")
+            instance.process.wait()
+        instance.process = None
+        logger.info("vLLM (%s) stopped", name)
 
     @classmethod
-    def is_alive(cls) -> bool:
-        """检查 vLLM 进程是否存活。"""
-        return cls.process is not None and cls.process.poll() is None
+    def start_all(cls) -> bool:
+        """启动所有 vLLM 实例。先启动 1.7B，再启动 0.6B。任一失败均返回 False。"""
+        # 1. 启动 1.7B（必须成功）
+        cls.primary = VLLMInstance(
+            port=settings.VLLM_PORT,
+            model_path=settings.VLLM_MODEL_PATH,
+            model_name=settings.VLLM_MODEL_NAME,
+        )
+        if not cls._start_instance(cls.primary, "1.7B"):
+            return False
+
+        # 2. 条件启动 0.6B（必须成功，失败则整个服务退出触发容器重启）
+        if settings.PROGRESSIVE_ENABLED:
+            if not settings.PROGRESSIVE_VLLM_MODEL_PATH:
+                logger.critical("PROGRESSIVE_ENABLED=true but PROGRESSIVE_VLLM_MODEL_PATH is empty")
+                return False
+            cls.progressive = VLLMInstance(
+                port=settings.PROGRESSIVE_VLLM_PORT,
+                model_path=settings.PROGRESSIVE_VLLM_MODEL_PATH,
+                model_name=settings.PROGRESSIVE_MODEL_NAME,
+            )
+            if not cls._start_instance(cls.progressive, "0.6B"):
+                logger.critical("Progressive vLLM (0.6B) failed to start")
+                return False
+            logger.info("Progressive vLLM (0.6B) started successfully")
+
+        return True
+
+    @classmethod
+    def stop_all(cls) -> None:
+        """关闭所有 vLLM 实例。"""
+        for inst, name in ((cls.progressive, "0.6B"), (cls.primary, "1.7B")):
+            if inst is not None:
+                cls._stop_instance(inst, name)
+        cls.primary = None
+        cls.progressive = None
+
+    @classmethod
+    def is_alive(cls, instance: VLLMInstance | None) -> bool:
+        """检查指定 vLLM 实例是否存活。"""
+        if instance is None:
+            return False
+        return instance.process is not None and instance.process.poll() is None
 
 
 # 用于通知 lifespan 进行优雅关闭的事件
@@ -132,9 +203,9 @@ _shutdown_event: asyncio.Event | None = None
 MAX_HEALTH_FAILURES = 3  # 连续失败次数阈值
 
 
-async def _health_monitor() -> None:
-    """后台持续监测 vLLM 健康，连续多次失败后通知优雅关闭。"""
-    health_url = f"http://127.0.0.1:{settings.VLLM_PORT}/v1/models"
+async def _health_monitor(instance: VLLMInstance, name: str) -> None:
+    """后台持续监测单个 vLLM 实例健康，连续多次失败后通知优雅关闭。"""
+    health_url = instance.health_url()
     interval = settings.VLLM_HEALTH_CHECK_INTERVAL
     consecutive_failures = 0
 
@@ -143,35 +214,34 @@ async def _health_monitor() -> None:
             await asyncio.sleep(interval)
 
             # 进程级检查
-            if not VLLMManager.is_alive():
-                logger.critical("vLLM process died, triggering shutdown")
+            if not VLLMManager.is_alive(instance):
+                logger.critical("vLLM (%s) process died, triggering shutdown", name)
                 if _shutdown_event:
                     _shutdown_event.set()
                 return
 
             # HTTP 级检查
             try:
-                # 添加 Connection: close 防止 vLLM(uvicorn) 的 5s keep-alive 机制导致连接断开抛出 RemoteProtocolError
                 r = await client.get(health_url, headers={"Connection": "close"})
                 if r.status_code == 200:
                     if consecutive_failures > 0:
-                        logger.info("vLLM health recovered after %d failures", consecutive_failures)
+                        logger.info("vLLM (%s) health recovered after %d failures", name, consecutive_failures)
                     consecutive_failures = 0
                     continue
                 else:
-                    logger.warning("vLLM health check returned %d", r.status_code)
+                    logger.warning("vLLM (%s) health check returned %d", name, r.status_code)
             except Exception:
-                logger.warning("vLLM health check request failed", exc_info=True)
+                logger.warning("vLLM (%s) health check request failed", name, exc_info=True)
 
             consecutive_failures += 1
             logger.warning(
-                "vLLM health check failed (%d/%d)",
-                consecutive_failures, MAX_HEALTH_FAILURES,
+                "vLLM (%s) health check failed (%d/%d)",
+                name, consecutive_failures, MAX_HEALTH_FAILURES,
             )
             if consecutive_failures >= MAX_HEALTH_FAILURES:
                 logger.critical(
-                    "vLLM health check failed %d consecutive times, triggering shutdown",
-                    MAX_HEALTH_FAILURES,
+                    "vLLM (%s) health check failed %d consecutive times, triggering shutdown",
+                    name, MAX_HEALTH_FAILURES,
                 )
                 if _shutdown_event:
                     _shutdown_event.set()
@@ -194,30 +264,48 @@ async def lifespan(app: FastAPI):
         settings.WS_PING_TIMEOUT,
     )
 
-    # 1. 启动 vLLM（同步阻塞，跑在线程池里以免卡住事件循环）
-    ok = await asyncio.to_thread(VLLMManager.start)
+    # 1. 启动 vLLM（1.7B → 0.6B，同步阻塞跑在线程池）
+    ok = await asyncio.to_thread(VLLMManager.start_all)
     if not ok:
         logger.critical("vLLM start failed, exiting")
         sys.exit(1)
 
-    # 2. 启动 vLLM 健康监测后台任务
-    monitor_task = asyncio.create_task(_health_monitor())
+    # 2. 启动健康监测（1.7B）
+    monitors: list[asyncio.Task] = []
+    assert VLLMManager.primary is not None
+    monitors.append(asyncio.create_task(_health_monitor(VLLMManager.primary, "1.7B")))
 
-    # 3. 启动 shutdown 监听（健康检查失败时触发优雅退出）
+    # 3. 启动 0.6B 健康监测（PROGRESSIVE_ENABLED 时必定存在，启动失败已 exit）
+    if VLLMManager.progressive is not None:
+        monitors.append(asyncio.create_task(_health_monitor(VLLMManager.progressive, "0.6B")))
+
+    # 4. shutdown 监听（健康检查失败时触发优雅退出）
     async def _watch_shutdown():
         await _shutdown_event.wait()
         logger.critical("Shutdown event received, stopping server...")
-        # 给 uvicorn 发 SIGTERM 触发优雅关闭流程
         os.kill(os.getpid(), signal.SIGTERM)
 
     shutdown_watcher = asyncio.create_task(_watch_shutdown())
 
-    # 4. ITN 多进程池（eager init）
+    # 5. ITN 多进程池（eager init）
     itn_pool.start()
     logger.info("ITN pool ready: %d workers", itn_pool.num_workers)
 
-    # 5. ASR HTTP 客户端
+    # 6. ASR HTTP 客户端（1.7B）
     await asr_service.startup()
+
+    # 7. Progressive ASR 客户端（0.6B）
+    if settings.PROGRESSIVE_ENABLED:
+        ws_module.progressive_asr_service = ASRService(
+            api_base=settings.PROGRESSIVE_API_BASE,
+            model_name=settings.PROGRESSIVE_MODEL_NAME,
+        )
+        await ws_module.progressive_asr_service.startup()
+        logger.info(
+            "Progressive ASR service started: api=%s, model=%s",
+            settings.PROGRESSIVE_API_BASE,
+            settings.PROGRESSIVE_MODEL_NAME,
+        )
 
     logger.info("All services initialized")
 
@@ -225,16 +313,19 @@ async def lifespan(app: FastAPI):
 
     # ---- 关闭 ----
     logger.info("Shutting down ASR service...")
-    monitor_task.cancel()
     shutdown_watcher.cancel()
-    for t in (monitor_task, shutdown_watcher):
+    for t in monitors:
+        t.cancel()
+    for t in monitors + [shutdown_watcher]:
         try:
             await t
         except asyncio.CancelledError:
             pass
     await asr_service.shutdown()
+    if ws_module.progressive_asr_service is not None:
+        await ws_module.progressive_asr_service.shutdown()
     itn_pool.shutdown()
-    VLLMManager.stop()
+    VLLMManager.stop_all()
     logger.info("Shutdown complete")
 
 

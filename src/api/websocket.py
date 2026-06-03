@@ -55,6 +55,7 @@ router = APIRouter()
 # 服务实例（由 main.py 生命周期管理器初始化）
 asr_service: ASRService = ASRService()
 itn_pool: ITNPool = ITNPool()
+progressive_asr_service: ASRService | None = None  # 仅 PROGRESSIVE_ENABLED 时初始化
 
 
 @router.websocket("/tuling/ast/v3")
@@ -274,15 +275,43 @@ async def _handle_audio_frame(
 
     # 对每个触发的语音段，启动后台 ASR+ITN 任务（不阻塞音频接收）
     for seg in segments:
+        session.cancel_progressive()
         task = asyncio.create_task(
             _process_segment(websocket, session, seg)
         )
         session.track_asr_task(task)
 
+    # VAD 丢弃短语音时 in_speech 已变 False 但 progressive buffer 未清理
+    if not session.vad.in_speech and session._progressive_audio_frames:
+        session.cancel_progressive()
+
+    # ---- 伪流式 progressive 调度 ----
+    if (settings.PROGRESSIVE_ENABLED
+            and progressive_asr_service is not None
+            and not segments
+            and session.vad.in_speech):
+        frame_start_sample = session._accumulated_audio_samples - len(pcm_int16)
+        session.append_progressive_audio(pcm_int16, frame_start_sample)
+
+        now = time.monotonic()
+        elapsed = now - session._progressive_last_send_time
+        task_idle = (session._progressive_task is None
+                     or session._progressive_task.done())
+
+        if elapsed >= settings.PROGRESSIVE_STEP and task_idle:
+            audio, start_sample, end_sample = session.pop_progressive_audio()
+            if len(audio) > 0:
+                session._progressive_task = asyncio.create_task(
+                    _process_progressive(websocket, session, audio, start_sample, end_sample)
+                )
+
 
 async def _handle_end_frame(websocket: WebSocket, session: ASRSession) -> None:
     """处理结束帧：刷空 VAD 缓冲区，等待所有 ASR 任务完成，推送终态。"""
     session.set_closing()
+
+    # 取消进行中的 progressive，防止在 status=2 之后发送
+    session.cancel_progressive()
 
     # 强制刷出残余音频（如有，标记为 final，与 status=2 捆绑发送）
     seg = session.vad.flush()
@@ -452,6 +481,64 @@ async def _process_segment(
                 await _send_error(websocket, session, f"ASR error: {exc}")
         except Exception:
             pass
+
+
+async def _process_progressive(
+    websocket: WebSocket,
+    session: ASRSession,
+    audio_int16: np.ndarray,
+    start_sample: int,
+    end_sample: int,
+) -> None:
+    """0.6B 模型 progressive 推理，结果立即回复客户端。
+
+    不走 push_result_in_order 排序，直接通过 send_lock 互斥发送。
+    不做 ITN 后处理（中间预览结果无需精确标点）。
+    """
+    seg_id = session.next_progressive_seg_id()
+    audio_ms = len(audio_int16) / 16.0
+
+    try:
+        raw_text = await progressive_asr_service.recognize(
+            audio_int16, sr=16000, context=session.hotword_context
+        )
+
+        bg_ms = samples_to_ms(start_sample)
+        ed_ms = samples_to_ms(end_sample)
+
+        result = ResultPayload(
+            segId=seg_id,
+            bg=bg_ms,
+            ed=ed_ms,
+            msgtype="progressive",
+            ws=[WSItem(cw=[CWItem(w=raw_text, wp="n")])],
+        )
+
+        response = ServerMessage(
+            header=ResponseHeader(
+                code=0,
+                message="progressive",
+                sid=session.sid,
+                traceId=session.trace_id,
+                status=1,
+            ),
+            payload=ResponsePayloadWrapper(result=result),
+        )
+
+        async with session.send_lock:
+            await websocket.send_text(response.model_dump_json())
+
+        logger.debug(
+            "Progressive sent: seg_id=%d, text=%s, audio=%.0fms, pos=[%d-%d]ms",
+            seg_id, raw_text, audio_ms, bg_ms, ed_ms,
+        )
+
+    except asyncio.CancelledError:
+        logger.debug("Progressive task cancelled: sid=%s, seg_id=%d", session.sid, seg_id)
+    except (WebSocketDisconnect, ClientDisconnected):
+        logger.debug("Client disconnected during progressive send: sid=%s, seg_id=%d", session.sid, seg_id)
+    except Exception as exc:
+        logger.warning("Progressive ASR failed: sid=%s, error=%s", session.sid, exc)
 
 
 async def _send_response(
