@@ -84,11 +84,13 @@ class VLLMManager:
             logger.info("vLLM (%s) process already running: port=%d", name, instance.port)
             return True
 
+        # 0.6B 使用独立的启动参数，1.7B 使用原有参数
+        is_progressive = instance.port == settings.PROGRESSIVE_VLLM_PORT
         cmd = instance.build_cmd(
-            settings.VLLM_TENSOR_PARALLEL_SIZE,
-            settings.VLLM_MAX_MODEL_LEN,
-            settings.VLLM_GPU_MEMORY_UTILIZATION,
-            settings.VLLM_EXTRA_ARGS,
+            settings.PROGRESSIVE_TENSOR_PARALLEL_SIZE if is_progressive else settings.VLLM_TENSOR_PARALLEL_SIZE,
+            settings.PROGRESSIVE_MAX_MODEL_LEN if is_progressive else settings.VLLM_MAX_MODEL_LEN,
+            settings.PROGRESSIVE_GPU_MEMORY_UTILIZATION if is_progressive else settings.VLLM_GPU_MEMORY_UTILIZATION,
+            settings.PROGRESSIVE_EXTRA_ARGS if is_progressive else settings.VLLM_EXTRA_ARGS,
         )
         logger.info("Starting vLLM (%s): %s", name, " ".join(cmd))
 

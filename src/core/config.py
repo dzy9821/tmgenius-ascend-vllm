@@ -95,6 +95,24 @@ class Settings:
     )
     """0.6B vLLM 启动超时（秒）。"""
 
+    PROGRESSIVE_TENSOR_PARALLEL_SIZE: int = int(
+        os.getenv("PROGRESSIVE_TENSOR_PARALLEL_SIZE", "1")
+    )
+    """0.6B vLLM 张量并行数。"""
+
+    PROGRESSIVE_MAX_MODEL_LEN: int = int(
+        os.getenv("PROGRESSIVE_MAX_MODEL_LEN", "32768")
+    )
+    """0.6B vLLM 最大模型长度。"""
+
+    PROGRESSIVE_GPU_MEMORY_UTILIZATION: float = float(
+        os.getenv("PROGRESSIVE_GPU_MEMORY_UTILIZATION", "0.3")
+    )
+    """0.6B vLLM GPU 显存利用率。"""
+
+    PROGRESSIVE_EXTRA_ARGS: str = os.getenv("PROGRESSIVE_EXTRA_ARGS", "")
+    """0.6B vLLM 额外启动参数。"""
+
     # ---- VAD 动态断句阈值 ----
     VAD_HOP_SIZE: int = int(os.getenv("VAD_HOP_SIZE", "640"))
     """VAD 帧长（采样数），16kHz 下 640 = 40ms，对齐客户端发送间隔。"""
