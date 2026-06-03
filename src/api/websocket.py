@@ -503,6 +503,9 @@ async def _process_progressive(
             audio_int16, sr=16000, context=session.hotword_context
         )
 
+        # 累加本段文本到当前语音段的累积结果
+        session._progressive_accumulated_text += raw_text
+
         bg_ms = samples_to_ms(start_sample)
         ed_ms = samples_to_ms(end_sample)
 
@@ -511,7 +514,7 @@ async def _process_progressive(
             bg=bg_ms,
             ed=ed_ms,
             msgtype="progressive",
-            ws=[WSItem(cw=[CWItem(w=raw_text, wp="n")])],
+            ws=[WSItem(cw=[CWItem(w=session._progressive_accumulated_text, wp="n")])],
         )
 
         response = ServerMessage(
@@ -529,8 +532,8 @@ async def _process_progressive(
             await websocket.send_text(response.model_dump_json())
 
         logger.debug(
-            "Progressive sent: seg_id=%d, text=%s, audio=%.0fms, pos=[%d-%d]ms",
-            seg_id, raw_text, audio_ms, bg_ms, ed_ms,
+            "Progressive sent: seg_id=%d, fragment=%s, accumulated=%s, audio=%.0fms, pos=[%d-%d]ms",
+            seg_id, raw_text, session._progressive_accumulated_text, audio_ms, bg_ms, ed_ms,
         )
 
     except asyncio.CancelledError:

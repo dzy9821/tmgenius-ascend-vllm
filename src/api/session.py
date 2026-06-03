@@ -84,6 +84,7 @@ class ASRSession:
         self._progressive_total_samples: int = 0                # 缓冲区内累计采样数
         self._progressive_start_sample: int = 0                 # 缓冲区首帧对应的全局采样偏移
         self._progressive_last_send_time: float = 0.0           # 上一次发起 progressive 的时间（0 = 未开始）
+        self._progressive_accumulated_text: str = ""             # 当前语音段内已识别文本的累加结果
 
         # ---- 音频到达延时诊断 ----
         self._connection_start_time: float = 0.0  # 流式开始时刻 (time.monotonic)
@@ -181,6 +182,7 @@ class ASRSession:
         self._progressive_start_sample = 0
         self._progressive_last_send_time = 0.0
         self._progressive_seg_id = 0
+        self._progressive_accumulated_text = ""
 
     def next_seg_id(self) -> int:
         """获取当前段号并递增。"""

@@ -61,7 +61,7 @@ class Settings:
     """送给 ASR 时首尾各附加的真实音频上下文帧数（帧长 = VAD_HOP_SIZE samples），替代静默填充。"""
 
     # ---- 伪流式 Progressive ----
-    PROGRESSIVE_ENABLED: bool = os.getenv("PROGRESSIVE_ENABLED", "false").lower() == "true"
+    PROGRESSIVE_ENABLED: bool = os.getenv("PROGRESSIVE_ENABLED", "true").lower() == "true"
     """是否启用伪流式 progressive 推理。"""
 
     PROGRESSIVE_STEP: float = float(os.getenv("PROGRESSIVE_STEP", "0.6"))
