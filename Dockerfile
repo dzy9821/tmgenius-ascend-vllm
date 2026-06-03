@@ -12,7 +12,7 @@ RUN apt-get update && \
 
 # ---- 2. OpenFst（需真实 ARM64 libfst*.so 置于 3rd-party/openfst/lib/）----
 COPY 3rd-party/openfst1.8.3/lib/* /usr/local/lib/
-COPY 3rd-party/openfst1.8.3/include/ /usr/local/include/
+COPY 3rd-party/openfst1.8.3/include/ /usr/local/include/fst/
 RUN echo /usr/local/lib > /etc/ld.so.conf.d/openfst.conf && ldconfig
 
 # ---- 3. Python 依赖（先 COPY 慢变文件，最大化构建缓存）----

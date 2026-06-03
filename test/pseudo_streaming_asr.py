@@ -61,7 +61,7 @@ def create_client(base_url: str, api_key: str = "EMPTY"):
 
 
 async def asr_recognize(client, audio: np.ndarray, sr: int, model: str, context: str = "") -> str:
-    messages = []
+    messages: list[dict] = []
     if context:
         messages.append({"role": "system", "content": context})
     messages.append({
