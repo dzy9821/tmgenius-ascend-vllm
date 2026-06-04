@@ -249,7 +249,7 @@ services:
       # ---- ITN ----
       ITN_WORKERS: "8"
       # ---- 热词 ----
-      HOTWORDS: "警单"
+      HOTWORDS: ""
       # ---- VAD ----
       VAD_HOP_SIZE: "640"
       VAD_THRESHOLD: "0.4"
