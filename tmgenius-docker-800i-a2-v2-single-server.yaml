@@ -211,7 +211,7 @@ services:
     ports:
       - "8856:8856"    # ASR WebSocket（宿主 18856 → 容器 8856）
       - "15002:15002"  # 1.7B vLLM 推理服务
-      - "15003:15003"  # 0.6B vLLM 推理服务（progressive）
+      - "15004:15004"  # 0.6B vLLM 推理服务（progressive）
 
     volumes:
       - /usr/local/dcmi:/usr/local/dcmi:ro
@@ -242,7 +242,7 @@ services:
       VLLM_PORT: "15002"
       VLLM_TENSOR_PARALLEL_SIZE: "1"
       VLLM_MAX_MODEL_LEN: "32768"
-      VLLM_GPU_MEMORY_UTILIZATION: "0.3"
+      VLLM_GPU_MEMORY_UTILIZATION: "0.22"
       VLLM_EXTRA_ARGS: "--dtype bfloat16"
       VLLM_STARTUP_TIMEOUT: "3000"
       VLLM_HEALTH_CHECK_INTERVAL: "5"
@@ -262,12 +262,12 @@ services:
       PROGRESSIVE_ENABLED: "true"
       PROGRESSIVE_STEP: "0.6"
       # Progressive vLLM 子进程独立启动参数
-      PROGRESSIVE_VLLM_PORT: "15003"
+      PROGRESSIVE_VLLM_PORT: "15004"
       PROGRESSIVE_VLLM_MODEL_PATH: "/weights/Qwen3-ASR-0.6B"
       PROGRESSIVE_MODEL_NAME: "Qwen3-ASR-0.6B"
       PROGRESSIVE_TENSOR_PARALLEL_SIZE: "1"
       PROGRESSIVE_MAX_MODEL_LEN: "32768"
-      PROGRESSIVE_GPU_MEMORY_UTILIZATION: "0.2"
+      PROGRESSIVE_GPU_MEMORY_UTILIZATION: "0.22"
       PROGRESSIVE_EXTRA_ARGS: "--dtype bfloat16"
       PROGRESSIVE_STARTUP_TIMEOUT: "1200"
       PROGRESSIVE_HEALTH_CHECK_INTERVAL: "5"
